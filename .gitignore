@@ -21,6 +21,9 @@ mlartifacts/
 .DS_Store
 Thumbs.db
 
+# Claude Code local settings
+.claude/
+
 # Secrets / credentials
 *.json
 !package.json
