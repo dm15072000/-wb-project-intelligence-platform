@@ -1,0 +1,14 @@
+<style>
+html,body,[class*="css"]{font-family:sans-serif;}
+.hero{background:linear-gradient(120deg,#002147,#003d7a,#0057b7);border-radius:14px;padding:2rem 2.4rem;margin-bottom:1.5rem;}
+.hero h1{color:#fff;font-size:1.8rem;font-weight:700;margin:0 0 .3rem;}
+.hero p{color:#9ec4f0;font-size:.9rem;margin:0;}
+.metric-card{background:#1a1f2e;border:1px solid #252d40;border-radius:10px;padding:1rem 1.2rem;text-align:center;}
+.metric-val{color:#4da6ff;font-size:1.6rem;font-weight:700;}
+.metric-lbl{color:#6b7a99;font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;}
+.answer-box{background:#0f1520;border-left:4px solid #4da6ff;border-radius:0 8px 8px 0;padding:1.2rem 1.5rem;margin:1rem 0;color:#cdd8eb;font-size:.93rem;line-height:1.75;}
+.chip{display:inline-block;background:#1a2a3a;border:1px solid #2d4060;border-radius:4px;padding:.12rem .4rem;font-size:.72rem;color:#4da6ff;margin:.1rem .1rem 0 0;}
+.chunk{background:#111825;border:1px solid #1e2840;border-radius:8px;padding:.8rem 1rem;margin:.4rem 0;color:#8494af;font-size:.8rem;line-height:1.6;}
+.sec{color:#b8c8e0;font-size:1rem;font-weight:600;margin:1.3rem 0 .6rem;padding-bottom:.3rem;border-bottom:1px solid #1c2438;}
+.stButton>button{background:#1a4f8a;color:#fff;border:none;border-radius:6px;font-weight:600;}
+</style>
