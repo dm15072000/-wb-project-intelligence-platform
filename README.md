@@ -1,139 +1,170 @@
 # World Bank Project Intelligence Platform
 
-An end-to-end data intelligence platform built on **Databricks** and **Unity Catalog**, covering the full lifecycle of World Bank project portfolio data: ingestion from the public World Bank Projects API, a bronze/silver/gold medallion pipeline, a machine learning model that predicts project completion likelihood (served live via **Databricks Model Serving**), a **Retrieval-Augmented Generation (RAG)** system over project evaluation reports using **Foundation Model APIs**, a **Databricks SQL** portfolio analytics dashboard, and system-table-driven audit/observability queries.
+> **Live demo:** https://wbintelligence2-7474649658971091.aws.databricksapps.com
+> Try asking: *"What causes delays in World Bank projects?"* or *"What lessons are reported in Social Protection projects?"*
 
-The project is intentionally built the way a production data platform team would build it — governed through Unity Catalog, versioned and tracked through MLflow, and observable through Databricks' `system` schema — rather than as a one-off notebook demo.
+**22,729 projects · 30 ICR PDFs · 3,142 chunks · AUC 0.892 · RAG relevance 4.9/5.0 · 10 Databricks services**
 
-## Why this project
+---
 
-World Bank operations generate large volumes of structured project data (commitments, sectors, regions, lending instruments) alongside unstructured narrative data (Implementation Completion and Results Reports, or ICRs). This platform brings both together: a classifier that scores the likelihood a project reaches "Closed" rather than "Dropped" status, and a document QA system that lets an analyst ask natural-language questions and get answers grounded in and cited against real ICR text — with both views cross-checked against each other (e.g., "what do the numbers say about Social Protection projects in this region" vs. "what do the evaluation reports say").
+## What this is
 
-## Architecture overview
+The World Bank publishes two kinds of data that nobody combines: structured project records (sector, region, commitment size, outcome) and unstructured evaluation reports (ICRs — documents written by field teams after a project closes, describing what worked and what didn't). This platform ingests both, links them by project ID, and lets you query them together.
+
+The result: you can ask "why do Social Protection projects underperform in Europe?" and get a quantitative answer from Delta tables alongside narrative evidence retrieved from the actual evaluation reports — in one response.
+
+Built entirely on Databricks Free Edition, covering all 10 core services end-to-end.
+
+---
+
+## Architecture
 
 ```
-World Bank Projects API ─┐
-                          ▼
-                  ┌───────────────┐
-                  │  BRONZE       │  worldbank.bronze.projects_raw
-                  │  raw, as-is   │  (Delta, ingested via UC Volume landing zone)
-                  └───────┬───────┘
-                          ▼
-                  ┌───────────────┐
-                  │  SILVER       │  worldbank.silver.projects
-                  │  cleaned,     │  (typed, deduplicated, standardized schema)
-                  │  typed        │
-                  └───────┬───────┘
-                          ▼
-              ┌───────────┴────────────┐
-              ▼                        ▼
-      ┌───────────────┐        ┌───────────────┐
-      │  GOLD          │        │  ML            │  worldbank.ml.project_features
-      │  BI-ready      │        │  feature store │  worldbank.ml.project_success_model (UC Registry)
-      │  aggregates    │        │  + MLflow      │  → Model Serving endpoint: wb-project-success
-      └───────┬────────┘        └───────┬────────┘
-              ▼                         ▼
-      Databricks SQL Dashboard   Real-time predictions
-      "World Bank Portfolio        (REST invocations against
-       Analytics"                  the live serving endpoint)
-
-World Bank ICR PDFs ─┐
-                     ▼
-             ┌───────────────┐
-             │  DOCS schema  │  worldbank.docs.raw_pdfs (Volume)
-             │  chunk + embed│  worldbank.docs.icr_chunks
-             │               │  worldbank.docs.icr_embeddings
-             └───────┬───────┘  (embeddings via Foundation Model API
-                     ▼           `databricks-gte-large-en`, ai_query())
-             Delta-native cosine similarity retrieval
-                     ▼
-          `databricks-meta-llama-3-3-70b-instruct`
-             grounded, cited RAG answers
-                     ▼
-        LLM-as-judge evaluation → worldbank.ml.rag_eval_results
-
-system.* tables ──▶ Governance / lineage / cost / model-serving audit queries
+World Bank Projects API          World Bank Documents & Reports API
+(22,729 projects)                (30 ICR PDFs)
+        │                                │
+        ▼                                ▼
+  worldbank.bronze                UC Volume: docs/raw_pdfs
+  (raw JSON, Delta)               worldbank.docs.icr_chunks
+        │                         worldbank.docs.icr_embeddings
+        ▼                         (GTE Large EN, 1024-dim)
+  worldbank.silver                        │
+  (typed, deduped)                        │
+        │                                 │
+        ▼                                 ▼
+  worldbank.gold              cosine similarity retrieval
+  worldbank.ml.project_features           │
+        │                                 ▼
+        ▼                        Llama 3.3 70B generation
+  RandomForest classifier                 │
+  MLflow tracked                          ▼
+  UC model registry              LLM-as-judge evaluation
+  Model Serving endpoint         worldbank.ml.rag_eval_results
+        │                                 │
+        └──────────────┬──────────────────┘
+                       ▼
+              Databricks Workflows
+              (5-task scheduled DAG)
+                       │
+                       ▼
+              system.* audit tables
 ```
 
-See [`docs/architecture.png`](docs/architecture.png) for a visual diagram *(add your own — see Setup step 7)*.
+---
 
-## Pipeline components
+## The ML story
 
-| # | Notebook | Layer | What it does |
-|---|----------|-------|---------------|
-| 1 | [`01_ingest_projects.py`](notebooks/01_ingest_projects.py) | Bronze | Pulls project records from the public [World Bank Projects API](https://search.worldbank.org/api/v2/projects) with retry/backoff, lands them as JSON in a Unity Catalog Volume, and writes the Bronze Delta table `worldbank.bronze.projects_raw`. |
-| 2 | [`02_transform_projects.py`](notebooks/02_transform_projects.py) | Silver → ML features | Cleans and standardizes Silver project records, engineers a feature table (`worldbank.ml.project_features`) with leakage-aware feature selection (date-derived signals excluded from the "honest" model), missingness flags, and imputation. |
-| 3 | [`03_train_model.py`](notebooks/03_train_model.py) | ML / MLflow | Trains a `RandomForestClassifier` predicting project completion (`Closed` vs. `Dropped`), compares an all-features run against a leakage-free run, logs params/metrics/models to **MLflow**, registers the model to **Unity Catalog** as `worldbank.ml.project_success_model`, and calls the live **`wb-project-success`** Model Serving endpoint for real-time inference. Includes feature-importance and confusion-matrix analysis. |
-| 4 | [`04_ingest_documents.py`](notebooks/04_ingest_documents.py) | Docs / RAG | Downloads Implementation Completion and Results Report (ICR) PDFs, chunks them, generates embeddings via the **Foundation Model API** (`databricks-gte-large-en` through `ai_query`), and persists everything as Delta tables. Implements retrieval via **cosine similarity computed directly against the Delta-backed embedding table** (no external vector database) and generation via `databricks-meta-llama-3-3-70b-instruct`, with `mlflow.trace` instrumentation. |
-| 5 | [`05_evaluate.py`](notebooks/05_evaluate.py) | Evaluation | Runs formal `mlflow.evaluate()` classifier evaluation against the registered model, then evaluates the RAG pipeline against a golden question set using an **LLM-as-judge** pattern (relevance + correctness scoring), logging results to MLflow and to `worldbank.ml.rag_eval_results`. |
-| 6 | [`06_audit_logs.py`](notebooks/06_audit_logs.py) | Governance | Queries Databricks `system` schema tables — job/task run history, query history, Unity Catalog access audit logs, Model Serving usage/token counts, billing usage, and Delta `DESCRIBE HISTORY` lineage across bronze/silver/gold — for operational and governance visibility. |
+Training a classifier to predict whether a project closes successfully vs. gets dropped sounds straightforward. It wasn't.
 
-## Model Serving
+The first model scored AUC 0.999 — which should always be a red flag, not a celebration. Every dropped project in the dataset was cancelled before board approval, so none had an approval date. The `has_approval_date` flag I'd engineered as a safety feature was perfectly separating the two classes — the model wasn't learning risk signals, it was reading a bookkeeping artifact.
 
-The classifier trained in notebook 3 is registered to Unity Catalog (`worldbank.ml.project_success_model`) and deployed to a **live Databricks Model Serving endpoint named `wb-project-success`**. Notebook 3 invokes it directly over REST with a Databricks personal access token, demonstrating the full loop from training → registry → real-time serving → inference. See [`docs/mlflow_comparison.png`](docs/mlflow_comparison.png) for the MLflow run comparison between the full-feature and leakage-free models.
+I trained a second model without the date-derived features. AUC dropped to 0.892. That's the deployed model, registered as `@champion` in Unity Catalog. The leaky model is version 1; the honest model is version 3. The MLflow comparison view shows both runs side by side.
 
-## RAG pipeline
+**The rule I now follow:** any AUC above 0.95 on a real-world business outcome warrants a leakage investigation before you trust it.
 
-Rather than standing up a separate vector database, retrieval is implemented natively against Delta: embeddings generated through the Foundation Model API are stored as array columns in `worldbank.docs.icr_embeddings`, loaded into memory, and scored against a query embedding using vectorized cosine similarity (`matrix @ query_vector / norms`). This keeps the whole pipeline inside Unity Catalog governance boundaries and avoids extra infrastructure. Generation is grounded strictly in retrieved ICR text, with project IDs cited in every answer, and the whole pipeline is evaluated with an LLM-as-judge rubric — see [`docs/rag_eval_results.png`](docs/rag_eval_results.png).
+| Run | Features | AUC | F1 | Notes |
+|---|---|---|---|---|
+| `rf_all_features` | All incl. date flags | 0.999 | 0.995 | Leaky — not deployed |
+| `rf_no_leakage` | Region, sector, instrument, commitment | 0.892 | 0.967 | Champion — deployed |
 
-## Dashboard
+---
 
-The **"World Bank Portfolio Analytics"** Databricks SQL / Lakeview dashboard (queries extracted to [`sql/`](sql/)) surfaces:
-- Top sectors by commitment within each region
-- Portfolio growth over time (projects approved and commitment volume by year)
-- Completion rate by region
-- Top 15 countries by total commitment
+## The RAG pipeline
 
-See [`docs/dashboard.png`](docs/dashboard.png). The underlying pipeline is orchestrated as a Databricks Workflow — see [`docs/workflow_dag.png`](docs/workflow_dag.png) for the job DAG.
+30 ICR PDFs → 3,142 chunks → GTE Large EN embeddings stored in a Delta table → cosine similarity retrieval → Llama 3.3 70B generation.
 
-## Repository structure
+No external vector database. Embeddings live in `worldbank.docs.icr_embeddings` as array columns in Delta, loaded into a NumPy matrix at app startup, and scored with a matrix multiply. At 3,142 chunks this is sub-second. At millions of chunks the right answer is Databricks Vector Search with a Delta Sync index — migration would be one configuration change.
+
+Evaluated with LLM-as-judge: 8 hand-written question/reference-answer pairs, Llama 3.3 70B scoring each system answer on relevance and correctness (1–5). Mean relevance: **4.9/5.0**. Mean correctness: **4.4/5.0**. One question scored 2/5 on correctness — the relevant passage was at a chunk boundary. Documented as a known limitation; fix is reducing chunk size from 1,500 to 800 characters.
+
+---
+
+## Databricks services
+
+| Service | Where used |
+|---|---|
+| **Workspace** | All notebooks, Catalog Explorer |
+| **Delta Lake** | Every table — ACID writes, time travel, schema evolution |
+| **Unity Catalog** | `worldbank` catalog, 5 schemas, 2 Volumes, model registry |
+| **Lakehouse** | Files (PDFs, JSONL) + governed Delta tables on one platform |
+| **Databricks SQL** | 4 saved queries, serverless warehouse, published dashboard |
+| **MLflow** | 4 tracked runs, experiment comparison, UC model registry |
+| **Model Serving** | `wb-project-success` REST endpoint, scale-to-zero |
+| **Evaluation** | `mlflow.models.evaluate` + LLM-as-judge with logged metrics |
+| **Workflows** | 5-task DAG, two parallel branches, weekly schedule |
+| **Audit Logs** | `system.lakeflow`, `system.query.history`, `system.access.audit`, `DESCRIBE HISTORY` |
+
+---
+
+## Notebooks
+
+| Notebook | What it does |
+|---|---|
+| `01_ingest_projects.py` | Paginated fetch from World Bank Projects API with retry/backoff, lands raw JSON in a UC Volume, writes Bronze Delta table |
+| `02_transform_projects.py` | Silver cleaning (two date format fix, commitment casting, deduplication), Gold aggregates, ML feature table with missingness flags |
+| `03_train_model.py` | RandomForest training, leakage detection experiment, MLflow tracking, UC model registry, Model Serving endpoint test |
+| `04_ingest_documents.py` | ICR PDF download, pypdf parsing, chunking, GTE Large EN embedding via `ai_query()`, Delta storage, RAG pipeline with `@mlflow.trace` |
+| `05_evaluate.py` | `mlflow.models.evaluate` classifier eval, LLM-as-judge RAG eval over golden set, results to Delta |
+| `06_audit_logs.py` | System table queries: job run history, query history, access audit, serving usage, Delta DESCRIBE HISTORY lineage |
+
+---
+
+## Interesting bugs
+
+Three data problems I hit that aren't in any tutorial:
+
+**Date format split.** The Projects API returns `boardapprovaldate` in ISO format (`2013-06-28T00:00:00Z`) and `closingdate` in US 12-hour format with single-digit months (`6/30/2025 12:00:00 AM`). Same API, two columns, two formats. Found it by querying the exact failing values rather than guessing.
+
+**The vanishing label.** All 1,772 Dropped projects had `approval_date = NULL` — they were cancelled before board approval. `na.drop` on `approval_year` was silently removing the entire failure class. The feature table had 13,517 rows, all label=1. Fixed by relaxing the drop constraint and adding a `has_approval_date` flag (then caught that flag as the leakage source in training).
+
+**SparkContext on serverless.** `sparkContext.parallelize()` works interactively (you skip the cell) but crashes in a Workflow job (every cell runs). Replaced with writing raw JSON to a UC Volume and reading back with `spark.read.json()` — which is actually the better production pattern anyway.
+
+---
+
+## Repo structure
 
 ```
 wb-project-intelligence-platform/
-├── README.md
-├── .gitignore
+├── app/
+│   ├── app.py              # Streamlit app — 18 functions, live Spark via Databricks SDK
+│   ├── app.yml             # Databricks Apps deploy config
+│   ├── requirements.txt
+│   └── style.css
 ├── notebooks/
-│   ├── 01_ingest_projects.py       # Bronze: API ingestion
-│   ├── 02_transform_projects.py    # Silver → ML feature engineering
-│   ├── 03_train_model.py           # MLflow training + UC registry + serving call
-│   ├── 04_ingest_documents.py      # RAG: PDF ingestion, embeddings, retrieval
-│   ├── 05_evaluate.py              # Model evaluation + RAG LLM-as-judge eval
-│   └── 06_audit_logs.py            # Governance / system-table audit queries
+│   ├── 01_ingest_projects.py
+│   ├── 02_transform_projects.py
+│   ├── 03_train_model.py
+│   ├── 04_ingest_documents.py
+│   ├── 05_evaluate.py
+│   └── 06_audit_logs.py
+├── sql/
+│   ├── 01_catalog_setup.sql
+│   ├── 02_top_sectors.sql
+│   ├── 03_portfolio_growth.sql
+│   ├── 04_completion_rates.sql
+│   └── 05_audit_queries.sql
 ├── docs/
-│   ├── architecture.png            # Architecture diagram
-│   ├── dashboard.png               # Databricks SQL dashboard screenshot
-│   ├── mlflow_comparison.png       # MLflow run comparison screenshot
-│   ├── rag_eval_results.png        # RAG LLM-as-judge evaluation results
-│   └── workflow_dag.png            # Databricks Workflow job DAG
-└── sql/
-    ├── 01_catalog_setup.sql        # Unity Catalog + schema + volume bootstrap
-    ├── 02_top_sectors.sql          # Dashboard: top sectors / top countries
-    ├── 03_portfolio_growth.sql     # Dashboard: portfolio growth over time
-    ├── 04_completion_rates.sql     # Dashboard + supporting completion-rate queries
-    └── 05_audit_queries.sql        # Governance, lineage, cost/usage queries
+│   ├── dashboard.png
+│   ├── mlflow_comparison.png
+│   ├── rag_eval_results.png
+│   └── workflow_dag.png
+├── README.md
+└── .gitignore
 ```
 
-## Tech stack
+---
 
-| Layer | Technology |
-|---|---|
-| Storage & governance | Delta Lake, Unity Catalog (catalogs, schemas, volumes, lineage) |
-| Compute | Databricks (PySpark, Spark SQL) |
-| ML training & tracking | scikit-learn, MLflow (experiments, model registry, `mlflow.evaluate`, `mlflow.trace`) |
-| Model serving | Databricks Model Serving (`wb-project-success` endpoint) |
-| GenAI / RAG | Databricks Foundation Model APIs (`databricks-gte-large-en` embeddings, `databricks-meta-llama-3-3-70b-instruct` chat), `ai_query()`, Delta-native cosine similarity |
-| BI | Databricks SQL / Lakeview dashboards |
-| Observability | Databricks `system` schema (`lakeflow`, `query.history`, `access.audit`, `serving.endpoint_usage`, `billing.usage`) |
+## Stack
 
-## Setup / reproduction
+Python · PySpark · Databricks · Delta Lake · Unity Catalog · MLflow · scikit-learn · GTE Large EN · Llama 3.3 70B · Streamlit · Databricks Apps · Databricks SDK
 
-1. **Prerequisites**: a Databricks workspace with Unity Catalog enabled, a SQL warehouse, cluster/serverless compute, and access to Databricks Foundation Model APIs.
-2. **Bootstrap the catalog**: run [`sql/01_catalog_setup.sql`](sql/01_catalog_setup.sql) to create the `worldbank` catalog, its `bronze` / `silver` / `gold` / `docs` / `ml` schemas, and the required volumes.
-3. **Import the notebooks**: import everything under `notebooks/` into your workspace (e.g. `databricks workspace import-dir ./notebooks /Workspace/Users/<you>/wb-project-intelligence-platform`).
-4. **Run the pipeline in order**: execute notebooks `01` → `06` sequentially. Notebook 4 requires `pypdf` (`%pip install pypdf`, included in the notebook).
-5. **Deploy the model**: after notebook 3 registers `worldbank.ml.project_success_model` to Unity Catalog, create a Model Serving endpoint named `wb-project-success` from the registered model version (Serving → Create serving endpoint).
-6. **Build the dashboard**: recreate the four widgets in a new Databricks SQL / Lakeview dashboard using the queries in `sql/02_top_sectors.sql`, `sql/03_portfolio_growth.sql`, and `sql/04_completion_rates.sql`, pointed at your SQL warehouse.
-7. **Screenshots**: drop your own architecture diagram and dashboard/evaluation screenshots into `docs/` using the filenames referenced above (`architecture.png` is still needed).
+---
 
-## Notes on this repository
+## Setup
 
-This repo was assembled from live notebooks exported directly out of the author's Databricks workspace — the ingestion logic, feature engineering, model training, RAG retrieval, evaluation, and audit queries reflect an actual working pipeline, not illustrative pseudocode.
+1. Sign up for [Databricks Free Edition](https://databricks.com/learn/free-edition)
+2. Run `sql/01_catalog_setup.sql` to create the `worldbank` catalog and schemas
+3. Import notebooks from `notebooks/` into your workspace
+4. Run `01` → `06` in order (`01` takes ~10 min due to API pagination)
+5. Create a Model Serving endpoint named `wb-project-success` pointing at the registered UC model
+6. Deploy the app: copy `app/` contents into a workspace folder, deploy via Apps → Create app
